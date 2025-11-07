@@ -86,7 +86,6 @@ pip install -r requirements.txt
 
 Cài đặt các thư viện chuyên biệt:
 ```bash
-pip install facenet-pytorch
 pip install mamba-ssm
 ```
 
@@ -170,5 +169,4 @@ python main.py
 - Cân bằng số lượng ảnh thật và giả ở từng tập để ổn định quá trình học.
 - Lưu đệm các ảnh mặt đã cắt để tiết kiệm thời gian khi chạy lại thí nghiệm.
 
-Chúc bạn tái tạo thành công XcepMamba và mở rộng các thí nghiệm deepfake detection!
 
