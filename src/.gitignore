@@ -1,0 +1,12 @@
+data/
+results/
+test/
+Ref/
+
+runs/            # Thường là log chạy model, khá nặng
+Deepfake.zip     # File nén dữ liệu lớn, không nên up lên git
+check.xlsx       # File Excel (nếu đây là dữ liệu tạm)
+__pycache__/     # File rác do Python tự sinh ra (RẤT QUAN TRỌNG)
+*.pyc            # File compiled của Python
+.ipynb_checkpoints # Nếu bạn dùng Jupyter Notebook
+.idea

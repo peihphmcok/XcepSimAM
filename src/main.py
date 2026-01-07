@@ -1,384 +1,419 @@
-# Lưu với tên: src/main.py
-import json
 import os
-import time
+import json
+import warnings
+from datetime import datetime
 from pathlib import Path
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import seaborn as sns
+from PIL import Image
+from tqdm.auto import tqdm
+import matplotlib.pyplot as plt
+import cv2
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from sklearn.metrics import (accuracy_score, f1_score, roc_auc_score, matthews_corrcoef,
-                             confusion_matrix, roc_curve, precision_recall_curve,
-                             average_precision_score)
-from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, Dataset
-from tqdm import tqdm
-from torch.cuda.amp import autocast, GradScaler
-from PIL import Image
-
-# --- NHẬP TỪ CÁC FILE KHÁC TRONG `src/` ---
-from models.master_model import ConfigurableXcepMamba
-
-
-# (Giả sử bạn đã tạo các file này trong src/utils/)
-# from utils.dataset import DeepfakeDataset
-# from utils.transforms import train_transform, val_test_transform
-# from utils.losses import FocalLoss
-# from utils.metrics import calculate_metrics
-# from utils.visualize import save_plots
-
-# --- BẮT ĐẦU ĐỊNH NGHĨA CÁC HÀM UTILS (Tạm thời để ở đây cho dễ chạy) ---
-# (Bạn nên tách các class/hàm này ra file riêng trong src/utils/)
-
-class FocalLoss(nn.Module):
-    def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
-        super().__init__()
-        self.alpha = alpha;
-        self.gamma = gamma;
-        self.reduction = reduction
-
-    def forward(self, inputs, targets):
-        bce_loss = nn.functional.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
-        pt = torch.exp(-bce_loss)
-        focal_loss = (1 - pt) ** self.gamma * bce_loss
-        if self.alpha is not None:
-            alpha_t = self.alpha[0] * (1 - targets) + self.alpha[1] * targets
-            focal_loss = alpha_t * focal_loss
-        return focal_loss.mean() if self.reduction == 'mean' else focal_loss.sum()
-
-
-def calculate_metrics(y_true, y_pred_prob, threshold=0.5):
-    y_pred = (y_pred_prob >= threshold).astype(int)
-    cm = confusion_matrix(y_true, y_pred)
-    tn, fp, fn, tp = cm.ravel() if cm.size == 4 else (0, 0, 0, 0)
-    return {
-        'accuracy': accuracy_score(y_true, y_pred),
-        'f1': f1_score(y_true, y_pred, zero_division=0),
-        'auc': roc_auc_score(y_true, y_pred_prob) if len(np.unique(y_true)) > 1 else 0.5,
-        'mcc': matthews_corrcoef(y_true, y_pred),
-        'fake_detection_rate': tp / (tp + fn) if (tp + fn) > 0 else 0,
-        'real_detection_rate': tn / (tn + fp) if (tn + fp) > 0 else 0,
-        'confusion_matrix': cm,
-    }
-
-
-def save_plots(history, test_metrics, y_true, y_pred_prob, output_path, model_name):
-    Path(output_path).mkdir(parents=True, exist_ok=True)
-    # ... (Copy hàm save_plots đầy đủ của bạn vào đây) ...
-    print(f"Plots saved to {output_path}")
-
-
-# (Bạn cần class DeepfakeDataset và transforms của bạn ở đây)
-# Ví dụ (Placeholder - HÃY THAY BẰNG CODE CỦA BẠN):
 from torchvision import transforms
+from sklearn.metrics import accuracy_score, roc_auc_score, f1_score, precision_score, recall_score
+from models.XcepSimAM import XceptionSimAM
 
+from models.xception import xception
 
-class DeepfakeDataset(Dataset):
-    def __init__(self, csv_file, transform=None):
-        self.df = pd.read_csv(csv_file)
-        self.transform = transform
+warnings.filterwarnings("ignore")
+import ssl
+ssl._create_default_https_context = ssl._create_unverified_context
 
-    def __len__(self):
-        return len(self.df)
+def get_current_time_str():
+    return datetime.now().strftime('%Y%m%d_%H%M%S')
 
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        img_path = row['image_path']
-        label = row['label']
-        try:
-            image = Image.open(img_path).convert('RGB')
-        except Exception as e:
-            print(f"Warning: Không thể tải {img_path}, {e}. Dùng ảnh rỗng.")
-            image = Image.new('RGB', (256, 256))
-            label = 0
-
-        if self.transform:
-            image = self.transform(image)
-        return image, label, img_path
-
-
-train_transform = transforms.Compose([
-    transforms.Resize((256, 256)),
-    transforms.RandomHorizontalFlip(),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-])
-val_test_transform = transforms.Compose([
-    transforms.Resize((256, 256)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-])
-# --- KẾT THÚC PHẦN UTILS ---
-
-
-# --- CONFIG CHUNG ---
-CONFIG = {
-    'data_path': "data/final_csvs",  # Đường dẫn chuẩn
-    'base_model_path': "models/ablation_study",  # Đường dẫn chuẩn
-    'base_output_path': "results/ablation_study",  # Đường dẫn chuẩn
-    'batch_size': 16,
+BASE_CONFIG = {
+    'project_name': 'XcepSimAM_Scientific',
+    'data_path': 'preprocessing/splits',
+    'root_data_dir': os.getcwd(),
+    'model_params': {
+        'num_classes': 2,
+        'dropout': 0.5
+    },
+    'max_videos': 50, # Set to None to use full dataset
+    'img_size': 224,
+    'batch_size': 64,
+    'lr': 0.0001,
+    'epochs': 20,
+    'lr_decay_step': 5,
+    'lr_decay_gamma': 0.5,
+    'seed': 42,
     'num_workers': 4,
-    'learning_rate': 2e-4,
-    'weight_decay': 1e-4,
-    'alpha': 0.82,
-    'gamma': 2.0,
-    'patience': 5,
-    'total_epochs': 25,
-    'device': torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    'device': 'cuda' if torch.cuda.is_available() else 'cpu'
 }
 
-# --- DANH SÁCH THÍ NGHIỆM ĐỂ CHẠY ---
-EXPERIMENT_CONFIGS = [
-    # 1. MÔ HÌNH CUỐI CÙNG (Cốt lõi)
-    {
-        "id": "FINAL_XcepMamba (Hierarchical+SimAM+Mamba)",
-        "middle_flow": "hierarchical",
-        "attention": "simam",
-        "encoder": "mamba"
-    },
+class ResearchUtils:
+    def __init__(self, run_dir):
+        self.run_dir = Path(run_dir)
+        self.run_dir.mkdir(parents=True, exist_ok=True)
 
-    # 2. BẢNG 2: BÓC TÁCH MIDDLE FLOW
-    {
-        "id": "Ablation_T2_Sequential_Flow",
-        "middle_flow": "sequential",
-        "attention": "simam",
-        "encoder": "mamba"
-    },
-    {
-        "id": "Ablation_T2_Parallel3_Flow",
-        "middle_flow": "parallel_3_branch",
-        "attention": "simam",
-        "encoder": "mamba"
-    },
+    def save_config(self, config):
+        with open(self.run_dir / 'config.json', 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=4, default=str)
 
-    # 3. BẢNG 3: BÓC TÁCH ATTENTION
-    {
-        "id": "Ablation_T3_No_Attention",
-        "middle_flow": "hierarchical",
-        "attention": "none",
-        "encoder": "mamba"
-    },
+    def plot_history(self, history):
+        epochs = range(1, len(history['train_loss']) + 1)
+        fig, axs = plt.subplots(2, 3, figsize=(20, 12))
+        axs = axs.flatten()
+        metrics_map = [
+            ('loss', 'Loss', axs[0]), ('acc', 'Accuracy', axs[1]),
+            ('auc', 'AUC Score', axs[2]), ('f1', 'F1 Score', axs[3]),
+            ('precision', 'Precision', axs[4]), ('recall', 'Recall', axs[5])
+        ]
+        for key, title, ax in metrics_map:
+            if f'train_{key}' in history:
+                ax.plot(epochs, history[f'train_{key}'], 'b-o', label=f'Train {title}')
+                ax.plot(epochs, history[f'val_{key}'], 'r-o', label=f'Val {title}')
+                ax.set_title(title); ax.legend(); ax.grid(True, linestyle='--', alpha=0.7)
+        plt.tight_layout()
+        plt.savefig(self.run_dir / 'training_charts.png')
 
-    # 4. BẢNG 4: BÓC TÁCH ENCODER
-    {
-        "id": "Ablation_T4_GAP_Encoder",
-        "middle_flow": "hierarchical",
-        "attention": "simam",
-        "encoder": "gap"
-    }
-]
+class GradCAM:
+    """Class for generating Heatmap visualizations"""
+    def __init__(self, model, target_layer):
+        self.model = model
+        self.target_layer = target_layer
+        self.gradients = None
+        self.activations = None
+        
+        self.target_layer.register_forward_hook(self.save_activation)
+        self.target_layer.register_full_backward_hook(self.save_gradient)
 
+    def save_activation(self, module, input, output):
+        self.activations = output
 
-# --- LOGIC HUẤN LUYỆN (NÊN TÁCH RA src/train.py) ---
-def train_epoch(model, dataloader, criterion, optimizer, scaler, device):
-    model.train()
-    running_loss = 0.0
-    all_preds, all_labels = [], []
-    progress_bar = tqdm(dataloader, desc='Training', leave=False)
-    for images, labels, _ in progress_bar:
-        images, labels = images.to(device), labels.to(device).float().unsqueeze(1)
-        optimizer.zero_grad()
-        with autocast():
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
+    def save_gradient(self, module, grad_input, grad_output):
+        self.gradients = grad_output[0]
 
-        running_loss += loss.item() * images.size(0)
-        all_preds.extend(torch.sigmoid(outputs).detach().cpu().numpy().flatten())
-        all_labels.extend(labels.cpu().numpy().flatten())
-        progress_bar.set_postfix({'loss': f'{loss.item():.4f}'})
+    def __call__(self, x, class_idx=None):
+        self.model.eval()
+        output = self.model(x)
+        if class_idx is None:
+            class_idx = torch.argmax(output, dim=1)
+        self.model.zero_grad()
+        target = output[0, class_idx]
+        target.backward()
 
-    epoch_loss = running_loss / len(dataloader.dataset)
-    metrics = calculate_metrics(np.array(all_labels), np.array(all_preds))
-    return epoch_loss, metrics
+        gradients = self.gradients.data.cpu().numpy()[0]
+        activations = self.activations.data.cpu().numpy()[0]
+        weights = np.mean(gradients, axis=(1, 2))
+        cam = np.zeros(activations.shape[1:], dtype=np.float32)
 
+        for i, w in enumerate(weights):
+            cam += w * activations[i]
 
-def validate_epoch(model, dataloader, criterion, device):
-    model.eval()
-    running_loss = 0.0
-    all_preds, all_labels = [], []
-    progress_bar = tqdm(dataloader, desc='Validation', leave=False)
-    with torch.no_grad():
-        for images, labels, _ in progress_bar:
-            images, labels = images.to(device), labels.to(device).float().unsqueeze(1)
-            with autocast():
-                outputs = model(images)
-                loss = criterion(outputs, labels)
-            running_loss += loss.item() * images.size(0)
-            all_preds.extend(torch.sigmoid(outputs).cpu().numpy().flatten())
-            all_labels.extend(labels.cpu().numpy().flatten())
-            progress_bar.set_postfix({'loss': f'{loss.item():.4f}'})
+        cam = np.maximum(cam, 0)
+        cam = cv2.resize(cam, (x.shape[3], x.shape[2]))
+        cam = cam - np.min(cam)
+        cam = cam / (np.max(cam) + 1e-7)
+        return cam
 
-    epoch_loss = running_loss / len(dataloader.dataset)
-    metrics = calculate_metrics(np.array(all_labels), np.array(all_preds))
-    return epoch_loss, metrics, np.array(all_labels), np.array(all_preds)
+def generate_visualizations(model, loader, device, run_dir, num_samples=5):
+    print("\n[Info] Generating Grad-CAM visualizations...")
+    # Target the last convolutional layer in Exit Flow
+    target_layer = model.exit_sep_conv_2 
+    grad_cam = GradCAM(model, target_layer)
+    
+    mean = np.array([0.485, 0.456, 0.406])
+    std = np.array([0.229, 0.224, 0.225])
+    
+    found_real, found_fake = 0, 0
+    images_to_show = [] 
+    
+    for imgs, lbls in loader:
+        if found_real >= num_samples and found_fake >= num_samples:
+            break
+        imgs, lbls = imgs.to(device), lbls.to(device)
+        outputs = model(imgs)
+        preds = torch.argmax(outputs, dim=1)
+        
+        for i in range(imgs.size(0)):
+            label = lbls[i].item()
+            pred = preds[i].item()
+            # Only visualize correctly classified samples
+            if label == pred: 
+                if label == 0 and found_real < num_samples:
+                    images_to_show.append((imgs[i], label, "Real"))
+                    found_real += 1
+                elif label == 1 and found_fake < num_samples:
+                    images_to_show.append((imgs[i], label, "Fake"))
+                    found_fake += 1
 
-
-def train_experiment(exp_config, train_loader, val_loader, test_loader):
-    model_key = exp_config['id']
-    print("\n" + "=" * 80)
-    print(f"BẮT ĐẦU THÍ NGHIỆM: {model_key}")
-    print(f"Cấu hình: {exp_config}")
-    print("=" * 80)
-
-    # 1. Tạo Model
-    model = ConfigurableXcepMamba(
-        num_classes=1,
-        middle_flow_type=exp_config['middle_flow'],
-        attention_type=exp_config['attention'],
-        encoder_type=exp_config['encoder']
-    ).to(CONFIG['device'])
-
-    params = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
-    print(f"Parameters: {params:.2f}M")
-
-    # 2. Setup thư mục
-    model_save_path = Path(CONFIG['base_model_path']) / model_key
-    output_save_path = Path(CONFIG['base_output_path']) / model_key
-    model_save_path.mkdir(parents=True, exist_ok=True)
-    output_save_path.mkdir(parents=True, exist_ok=True)
-
-    # 3. Setup huấn luyện
-    criterion = FocalLoss(alpha=torch.tensor([CONFIG['alpha'], 1 - CONFIG['alpha']]), gamma=CONFIG['gamma'])
-    scaler = GradScaler()
-    history = {k: [] for k in
-               ['train_loss', 'val_loss', 'train_acc', 'val_acc', 'train_f1', 'val_f1', 'train_auc', 'val_auc']}
-    best_val_loss = float('inf')
-
-    optimizer = optim.Adam(model.parameters(), lr=CONFIG['learning_rate'], weight_decay=CONFIG['weight_decay'])
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=CONFIG['patience'])
-
-    print("Phase: Training From Scratch...")
-    for epoch in range(CONFIG['total_epochs']):
-        print(f"  Epoch {epoch + 1}/{CONFIG['total_epochs']}")
-        train_loss, train_metrics = train_epoch(model, train_loader, criterion, optimizer, scaler, CONFIG['device'])
-        val_loss, val_metrics, _, _ = validate_epoch(model, val_loader, criterion, CONFIG['device'])
-        scheduler.step(val_loss)
-
-        # Lưu history
-        history['train_loss'].append(train_loss);
-        history['val_loss'].append(val_loss)
-        history['train_acc'].append(train_metrics['accuracy']);
-        history['val_acc'].append(val_metrics['accuracy'])
-        history['train_f1'].append(train_metrics['f1']);
-        history['val_f1'].append(val_metrics['f1'])
-        history['train_auc'].append(train_metrics['auc']);
-        history['val_auc'].append(val_metrics['auc'])
-
-        print(
-            f"    Val Loss: {val_loss:.4f}, Val Acc: {val_metrics['accuracy']:.4f}, Val F1: {val_metrics['f1']:.4f}, Val AUC: {val_metrics['auc']:.4f}")
-
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save({'model_state_dict': model.state_dict()}, model_save_path / "best_model.pth")
-
-    # 4. Test (Dùng model tốt nhất)
-    print("\nLoading best model for testing...")
-    checkpoint = torch.load(model_save_path / "best_model.pth")
-    model.load_state_dict(checkpoint['model_state_dict'])
-    test_loss, test_metrics, y_true, y_pred_prob = validate_epoch(model, test_loader, criterion, CONFIG['device'])
-
-    print(f"\nTest Results for {model_key}:")
-    print(f"  Accuracy: {test_metrics['accuracy']:.4f}")
-    print(f"  F1-Score: {test_metrics['f1']:.4f}")
-    print(f"  AUC: {test_metrics['auc']:.4f}")
-    print(f"  MCC: {test_metrics['mcc']:.4f}")
-
-    # 5. Lưu kết quả
-    save_plots(history, test_metrics, y_true, y_pred_prob, output_save_path, model_key)
-    # (Bạn có thể gọi hàm analyze_misclassifications ở đây)
-
-    results = {
-        'model_id': model_key,
-        'test_loss': test_loss,
-        'accuracy': test_metrics['accuracy'],
-        'f1': test_metrics['f1'],
-        'auc': test_metrics['auc'],
-        'mcc': test_metrics['mcc'],
-        'middle_flow': exp_config['middle_flow'],
-        'attention': exp_config['attention'],
-        'encoder': exp_config['encoder'],
-        'parameters_M': params
-    }
-
-    with open(output_save_path / "results.json", 'w') as f:
-        json.dump(results, f, indent=2)
-
-    torch.cuda.empty_cache()
-    return results
-
-
-# --- HÀM MAIN (ĐIỀU KHIỂN) ---
-def main():
-    if not Path(CONFIG['data_path']).exists():
-        print(f"Lỗi: Không tìm thấy thư mục dữ liệu {CONFIG['data_path']}")
-        print("Vui lòng chạy 4 script tiền xử lý trong 'src/preprocessing/' trước.")
+    if not images_to_show:
+        print("[Warn] No correctly classified images found to visualize.")
         return
 
-    # Load data (Chỉ load 1 lần)
-    try:
-        train_dataset = DeepfakeDataset(Path(CONFIG['data_path']) / "train.csv", transform=train_transform)
-        val_dataset = DeepfakeDataset(Path(CONFIG['data_path']) / "val.csv", transform=val_test_transform)
-        test_dataset = DeepfakeDataset(Path(CONFIG['data_path']) / "test.csv", transform=val_test_transform)
-    except Exception as e:
-        print(f"Lỗi khi tải dataset: {e}")
-        print("Đảm bảo file train.csv, val.csv, test.csv tồn tại trong", CONFIG['data_path'])
-        return
+    rows = len(images_to_show)
+    fig, axs = plt.subplots(rows, 3, figsize=(12, 4 * rows))
+    if rows == 1: axs = axs.reshape(1, -1)
+    
+    fig.suptitle(f'Grad-CAM Analysis ({rows} samples)', fontsize=16)
+    
+    for idx, (img_tensor, label, tag) in enumerate(images_to_show):
+        input_tensor = img_tensor.unsqueeze(0)
+        mask = grad_cam(input_tensor, class_idx=label)
+        
+        # Denormalize
+        img_np = img_tensor.cpu().numpy().transpose(1, 2, 0)
+        img_np = std * img_np + mean
+        img_np = np.clip(img_np, 0, 1)
+        
+        # Heatmap & Overlay
+        heatmap = cv2.applyColorMap(np.uint8(255 * mask), cv2.COLORMAP_JET)
+        heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
+        heatmap = np.float32(heatmap) / 255
+        overlay = heatmap + img_np
+        overlay = overlay / np.max(overlay)
+        
+        axs[idx, 0].imshow(img_np); axs[idx, 0].set_title(f"Original ({tag})"); axs[idx, 0].axis('off')
+        axs[idx, 1].imshow(heatmap); axs[idx, 1].set_title("Attention Map"); axs[idx, 1].axis('off')
+        axs[idx, 2].imshow(overlay); axs[idx, 2].set_title("Overlay"); axs[idx, 2].axis('off')
 
-    train_loader = DataLoader(train_dataset, batch_size=CONFIG['batch_size'], shuffle=True,
-                              num_workers=CONFIG['num_workers'], pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=CONFIG['batch_size'], shuffle=False,
-                            num_workers=CONFIG['num_workers'], pin_memory=True)
-    test_loader = DataLoader(test_dataset, batch_size=CONFIG['batch_size'], shuffle=False,
-                             num_workers=CONFIG['num_workers'], pin_memory=True)
-    print(f"Data loaded: Train: {len(train_dataset)}, Val: {len(val_dataset)}, Test: {len(test_dataset)}")
+    plt.tight_layout()
+    plt.savefig(run_dir / 'visualization_results.png')
+    print(f"[Info] Visualizations saved to: {run_dir / 'visualization_results.png'}")
 
-    all_results = []
+def get_transforms(img_size):
+    norm_mean = [0.485, 0.456, 0.406]
+    norm_std = [0.229, 0.224, 0.225]
 
-    # Lặp qua tất cả các thí nghiệm đã định nghĩa
-    for exp_config in EXPERIMENT_CONFIGS:
+    train_ops = transforms.Compose([
+        transforms.Resize((img_size, img_size)),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomRotation(15),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=norm_mean, std=norm_std),
+        transforms.RandomErasing(p=0.2, scale=(0.02, 0.15))
+    ])
+
+    val_ops = transforms.Compose([
+        transforms.Resize((img_size, img_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=norm_mean, std=norm_std)
+    ])
+    return train_ops, val_ops
+
+def transfer_weights(custom_model, pretrained_model):
+    pretrained_dict = pretrained_model.state_dict()
+    custom_dict = custom_model.state_dict()
+    transfer_layers = []
+    
+    for name, param in pretrained_dict.items():
+        if name in custom_dict:
+            if param.shape == custom_dict[name].shape:
+                custom_dict[name].copy_(param)
+                transfer_layers.append(name)
+    
+    custom_model.load_state_dict(custom_dict)
+    print(f"[Info] Weights transferred successfully for {len(transfer_layers)} layers (Entry Flow).")
+    return custom_model
+
+class DeepfakeDataset(Dataset):
+    def __init__(self, csv_file, root_dir, transform=None, max_videos=None):
+        self.data = pd.read_csv(csv_file)
+        self.transform = transform
+        self.root_dir = root_dir
+
+        # --- Helper for Robust Path Extraction ---
+        def get_video_name(path_str):
+            clean_path = str(path_str).replace('\\', '/') # Fix Windows path issue
+            parts = clean_path.split('/')
+            return parts[-2] if len(parts) >= 2 else "unknown_video"
+
+        self.data['video_name'] = self.data['path'].apply(get_video_name)
+
+        if max_videos is not None:
+            unique_video_df = self.data[['video_name', 'label']].drop_duplicates(subset='video_name')
+            real_videos = unique_video_df[unique_video_df['label'] == 0]['video_name'].tolist()
+            fake_videos = unique_video_df[unique_video_df['label'] == 1]['video_name'].tolist()
+            
+            rng = np.random.RandomState(42)
+            rng.shuffle(real_videos)
+            rng.shuffle(fake_videos)
+            
+            # Balance selection
+            half_quota = max_videos // 2
+            selected_real = real_videos[:half_quota]
+            quota_fake = max_videos - len(selected_real) # Take remainder
+            selected_fake = fake_videos[:quota_fake]
+            
+            selected_videos = set(selected_real + selected_fake)
+            self.data = self.data[self.data['video_name'].isin(selected_videos)].reset_index(drop=True)
+            print(f"[Dataset] {os.path.basename(str(csv_file))}: Selected {len(selected_videos)} videos.")
+
+        # --- Statistics Reporting ---
+        label_counts = self.data['label'].value_counts()
+        num_real = label_counts.get(0, 0)
+        num_fake = label_counts.get(1, 0)
+        print(f"   -> Frames: {len(self.data)} | Real: {num_real} | Fake: {num_fake}")
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        row = self.data.iloc[idx]
+        
+        # --- FIX: Safe Path Handling ---
+        path_str = str(row['path']).replace('\\', '/')
+        parts = path_str.split('/')
+        
+        if len(parts) >= 2:
+            video_name = parts[-2]
+            filename = parts[-1]
+        else:
+            # Fallback for paths without directory structure
+            video_name = "unknown" 
+            filename = parts[-1]
+            
+        image_path = os.path.join(self.root_dir, 'data', 'ff_frame', video_name, filename)
+        # -------------------------------
+        
+        image = Image.new('RGB', (224, 224)) # Placeholder black image
         try:
-            results = train_experiment(exp_config, train_loader, val_loader, test_loader)
-            all_results.append(results)
-        except Exception as e:
-            print(f"LỖI nặng ở thí nghiệm {exp_config['id']}: {e}")
-            torch.cuda.empty_cache()
+            if os.path.exists(image_path):
+                image = Image.open(image_path).convert('RGB')
+        except Exception:
+            pass
+            
+        if self.transform:
+            image = self.transform(image)
+        return image, int(row['label'])
 
-    # 6. In Bảng Tổng kết
-    print("\n" + "=" * 80)
-    print("TỔNG KẾT TẤT CẢ THÍ NGHIỆM")
-    print("=" * 80)
+class Trainer:
+    def __init__(self, model, loaders, config, save_dir):
+        self.model = model.to(config['device'])
+        self.loaders = loaders
+        self.config = config
+        self.save_dir = save_dir
+        self.criterion = nn.CrossEntropyLoss()
+        self.optimizer = optim.Adam(model.parameters(), lr=config['lr'])
+        self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=config['lr_decay_step'], gamma=0.5)
 
-    if not all_results:
-        print("Không có kết quả nào để tổng kết.")
-        return
+        self.history = {k: [] for k in ['train_loss', 'val_loss', 'train_acc', 'val_acc', 'train_auc', 'val_auc', 'train_f1', 'val_f1', 'train_precision', 'val_precision', 'train_recall', 'val_recall']}
+        self.best_acc = 0.0
+        self.best_epoch = -1
 
-    df = pd.DataFrame(all_results)
-    df = df.set_index('model_id')
+    def compute_metrics(self, loss, labels, preds, probs):
+        acc = accuracy_score(labels, preds)
+        f1 = f1_score(labels, preds, average='macro', zero_division=0)
+        precision = precision_score(labels, preds, average='macro', zero_division=0)
+        recall = recall_score(labels, preds, average='macro', zero_division=0)
+        try:
+            auc = roc_auc_score(labels, probs)
+        except:
+            auc = 0.5
+        return {'loss': loss, 'acc': acc, 'auc': auc, 'f1': f1, 'precision': precision, 'recall': recall}
 
-    columns_order = [
-        'accuracy', 'f1', 'auc', 'mcc',
-        'parameters_M', 'middle_flow', 'attention', 'encoder'
-    ]
-    # Lọc các cột có tồn tại trong df
-    final_columns = [col for col in columns_order if col in df.columns]
-    df = df[final_columns]
+    def train_epoch(self):
+        self.model.train()
+        total_loss = 0; all_lbl = []; all_pred = []; all_prob = []
+        
+        for imgs, lbls in tqdm(self.loaders['train'], desc="Train", leave=False):
+            imgs, lbls = imgs.to(self.config['device']), lbls.to(self.config['device'])
+            self.optimizer.zero_grad()
+            out = self.model(imgs)
+            loss = self.criterion(out, lbls)
+            loss.backward()
+            self.optimizer.step()
+            
+            total_loss += loss.item() * imgs.size(0)
+            probs = torch.softmax(out, dim=1)[:, 1].detach().cpu().numpy()
+            preds = torch.argmax(out, dim=1).detach().cpu().numpy()
+            all_lbl.extend(lbls.cpu().numpy()); all_pred.extend(preds); all_prob.extend(probs)
+            
+        return self.compute_metrics(total_loss / len(self.loaders['train'].dataset), all_lbl, all_pred, all_prob)
 
-    print(df.to_markdown(floatfmt=".4f"))
+    @torch.no_grad()
+    def evaluate(self, phase='val'):
+        self.model.eval()
+        total_loss = 0; all_lbl = []; all_pred = []; all_prob = []
+        
+        for imgs, lbls in tqdm(self.loaders[phase], desc=phase, leave=False):
+            imgs, lbls = imgs.to(self.config['device']), lbls.to(self.config['device'])
+            out = self.model(imgs)
+            loss = self.criterion(out, lbls)
+            total_loss += loss.item() * imgs.size(0)
+            probs = torch.softmax(out, dim=1)[:, 1].cpu().numpy()
+            preds = torch.argmax(out, dim=1).cpu().numpy()
+            all_lbl.extend(lbls.cpu().numpy()); all_pred.extend(preds); all_prob.extend(probs)
+            
+        return self.compute_metrics(total_loss / len(self.loaders[phase].dataset), all_lbl, all_pred, all_prob)
 
-    # Lưu bảng tổng kết
-    summary_path = Path(CONFIG['base_output_path']) / "final_ablation_summary.csv"
-    df.to_csv(summary_path)
-    print(f"\nBảng tổng kết đã được lưu vào: {summary_path}")
+    def run(self):
+        print(f"Device: {self.config['device']}")
+        for epoch in range(self.config['epochs']):
+            print(f"Epoch {epoch + 1}/{self.config['epochs']}")
+            train_res = self.train_epoch()
+            val_res = self.evaluate('val')
+            self.scheduler.step()
 
+            for k in ['loss', 'acc', 'auc', 'f1', 'precision', 'recall']:
+                self.history[f'train_{k}'].append(train_res[k])
+                self.history[f'val_{k}'].append(val_res[k])
+
+            print(f"Train | Loss: {train_res['loss']:.4f} | Acc: {train_res['acc']:.4f} | AUC: {train_res['auc']:.4f}")
+            print(f"Val   | Loss: {val_res['loss']:.4f} | Acc: {val_res['acc']:.4f} | AUC: {val_res['auc']:.4f}")
+
+            if val_res['acc'] > self.best_acc:
+                self.best_acc = val_res['acc']
+                self.best_epoch = epoch + 1
+                torch.save(self.model.state_dict(), self.save_dir / 'best_model.pth')
+                print(f"Best Model Saved (Epoch {self.best_epoch})")
+        
+        torch.save(self.model.state_dict(), self.save_dir / 'final_model.pth')
+        print("Final Model Saved.")
+
+def main():
+    run_dir = Path(f"runs/{get_current_time_str()}_{BASE_CONFIG['project_name']}")
+    utils = ResearchUtils(run_dir)
+    utils.save_config(BASE_CONFIG)
+    train_ops, val_ops = get_transforms(BASE_CONFIG['img_size'])
+    csv_dir = Path(BASE_CONFIG['data_path'])
+    
+    limit = BASE_CONFIG.get('max_videos', None)
+    train_set = DeepfakeDataset(csv_dir / 'train.csv', BASE_CONFIG['root_data_dir'], train_ops, limit)
+    val_set = DeepfakeDataset(csv_dir / 'val.csv', BASE_CONFIG['root_data_dir'], val_ops, limit)
+    test_set = DeepfakeDataset(csv_dir / 'test.csv', BASE_CONFIG['root_data_dir'], val_ops, limit)
+
+    loaders = {
+        'train': DataLoader(train_set, batch_size=BASE_CONFIG['batch_size'], shuffle=True, num_workers=4, pin_memory=True),
+        'val': DataLoader(val_set, batch_size=BASE_CONFIG['batch_size'], shuffle=False, num_workers=4, pin_memory=True),
+        'test': DataLoader(test_set, batch_size=BASE_CONFIG['batch_size'], shuffle=False, num_workers=4, pin_memory=True)
+    }
+
+    print("Initializing XcepSimAM...")
+    model = XceptionSimAM(num_classes=BASE_CONFIG['model_params']['num_classes'])
+    
+    try:
+        print("Transferring ImageNet Weights...")
+        std_model = xception(pretrained='imagenet')
+        model = transfer_weights(model, std_model)
+        del std_model
+    except Exception as e:
+        print(f"Weight transfer failed ({e}). Training from scratch.")
+
+    trainer = Trainer(model, loaders, BASE_CONFIG, run_dir)
+    trainer.run()
+    
+    utils.plot_history(trainer.history)
+    
+    if (run_dir / 'best_model.pth').exists():
+        print(f"Loading Best Model (Epoch {trainer.best_epoch})...")
+        model.load_state_dict(torch.load(run_dir / 'best_model.pth'))
+        
+        test_res = trainer.evaluate('test')
+        print("="*30)
+        print("Final Test Results (Best Model):")
+        print(f"Acc: {test_res['acc']:.4f} | AUC: {test_res['auc']:.4f} | F1: {test_res['f1']:.4f} | Prec: {test_res['precision']:.4f} | Rec: {test_res['recall']:.4f}")
+        
+        # Generate Visualization
+        generate_visualizations(model, loaders['test'], BASE_CONFIG['device'], run_dir)
 
 if __name__ == "__main__":
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
     main()
