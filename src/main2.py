@@ -8,7 +8,7 @@ import pandas as pd
 from PIL import Image
 from tqdm.auto import tqdm
 import matplotlib.pyplot as plt
-import cv2
+import cv2 
 
 import torch
 import torch.nn as nn
@@ -17,37 +17,36 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from sklearn.metrics import accuracy_score, roc_auc_score, f1_score, precision_score, recall_score
 
-from models.XcepSimAM import XceptionSimAM
 from models.xception import xception
 
-warnings.filterwarnings("ignore")
 import ssl
 ssl._create_default_https_context = ssl._create_unverified_context
+warnings.filterwarnings("ignore")
 
 def get_current_time_str():
     return datetime.now().strftime('%Y%m%d_%H%M%S')
 
-# --- CONFIGURATION ---
 BASE_CONFIG = {
-    'project_name': 'XcepSimAM_Custom',
-    'data_path': 'preprocessing/splits',
+    'project_name': 'Xception_Baseline', 
+    'data_path': 'preprocessing/splits',  
     'root_data_dir': os.getcwd(),
+
     'model_params': {
         'num_classes': 2,
         'dropout': 0.5
     },
+
+    'max_videos': None,        
+    'frames_per_video': 20,   
     
-    # Tùy ch?nh s? lu?ng video và frame t?i dây
-    'max_videos': None,         # Ð? None n?u mu?n l?y h?t, ho?c s? int (vd: 100)
-    'frames_per_video': 10,     # S? frame mu?n l?y m?i video (vd: 10)
-    
-    'img_size': 224,
-    'batch_size': 32,           # Gi?m batch size n?u full VRAM
+    'img_size': 224, 
+    'batch_size': 32,         
     'lr': 0.0001,
-    'epochs': 20,
+    'epochs': 20,         
     'lr_decay_step': 5,
     'lr_decay_gamma': 0.5,
     'seed': 42,
+
     'num_workers': 4,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu'
 }
@@ -56,7 +55,6 @@ class ResearchUtils:
     def __init__(self, run_dir):
         self.run_dir = Path(run_dir)
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        # T?o file log result.txt
         self.log_file = self.run_dir / 'result.txt'
         
         with open(self.log_file, 'w') as f:
@@ -66,7 +64,7 @@ class ResearchUtils:
             f.write("="*50 + "\n")
 
     def log(self, message):
-        """In ra màn hình và ghi vào file result.txt"""
+        """Prints to console and appends to result.txt"""
         print(message)
         with open(self.log_file, 'a') as f:
             f.write(message + '\n')
@@ -79,22 +77,24 @@ class ResearchUtils:
         epochs = range(1, len(history['train_loss']) + 1)
         fig, axs = plt.subplots(2, 3, figsize=(20, 12))
         axs = axs.flatten()
+
         metrics_map = [
             ('loss', 'Loss', axs[0]), ('acc', 'Accuracy', axs[1]),
             ('auc', 'AUC Score', axs[2]), ('f1', 'F1 Score', axs[3]),
             ('precision', 'Precision', axs[4]), ('recall', 'Recall', axs[5])
         ]
+
         for key, title, ax in metrics_map:
             if f'train_{key}' in history:
                 ax.plot(epochs, history[f'train_{key}'], 'b-o', label=f'Train {title}')
                 ax.plot(epochs, history[f'val_{key}'], 'r-o', label=f'Val {title}')
                 ax.set_title(title); ax.legend(); ax.grid(True, linestyle='--', alpha=0.7)
+        
         plt.tight_layout()
         plt.savefig(self.run_dir / 'training_charts.png')
         self.log(f"[Graph] Saved training history to {self.run_dir / 'training_charts.png'}")
 
 class GradCAM:
-    """Class for generating Heatmap visualizations (Explainable AI)"""
     def __init__(self, model, target_layer):
         self.model = model
         self.target_layer = target_layer
@@ -136,16 +136,17 @@ class GradCAM:
 def generate_visualizations(model, loader, device, run_dir, num_samples=5):
     print("\n[Info] Generating Grad-CAM visualizations...")
     try:
-        # Target layer specific to XceptionSimAM
-        target_layer = model.exit_sep_conv_2 
+        target_layer = model.conv4 
     except AttributeError:
-        print("[Warn] Could not find target layer for GradCAM.")
-        return
+        try:
+            target_layer = model.exit_flow.conv 
+        except:
+            print("[Warn] Could not find target layer (conv4) for GradCAM.")
+            return
 
     grad_cam = GradCAM(model, target_layer)
-    
-    mean = np.array([0.485, 0.456, 0.406])
-    std = np.array([0.229, 0.224, 0.225])
+    mean = np.array([0.5, 0.5, 0.5]) 
+    std = np.array([0.5, 0.5, 0.5])
     
     found_real, found_fake = 0, 0
     images_to_show = [] 
@@ -154,7 +155,7 @@ def generate_visualizations(model, loader, device, run_dir, num_samples=5):
         if found_real >= num_samples and found_fake >= num_samples:
             break
         imgs, lbls = imgs.to(device), lbls.to(device)
-        imgs.requires_grad = True # Ensure gradients can be computed
+        imgs.requires_grad = True 
         
         outputs = model(imgs)
         preds = torch.argmax(outputs, dim=1)
@@ -162,6 +163,7 @@ def generate_visualizations(model, loader, device, run_dir, num_samples=5):
         for i in range(imgs.size(0)):
             label = lbls[i].item()
             pred = preds[i].item()
+            
             if label == pred: 
                 if label == 0 and found_real < num_samples:
                     images_to_show.append((imgs[i].detach(), label, "Real"))
@@ -204,41 +206,24 @@ def generate_visualizations(model, loader, device, run_dir, num_samples=5):
     plt.savefig(run_dir / 'visualization_results.png')
     print(f"[Info] Visualizations saved to: {run_dir / 'visualization_results.png'}")
 
-def get_transforms(img_size):
-    norm_mean = [0.485, 0.456, 0.406]
-    norm_std = [0.229, 0.224, 0.225]
 
+def get_transforms(img_size):
     train_ops = transforms.Compose([
         transforms.Resize((img_size, img_size)),
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.RandomRotation(15),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+        transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=norm_mean, std=norm_std),
-        transforms.RandomErasing(p=0.2, scale=(0.02, 0.15))
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
     ])
 
     val_ops = transforms.Compose([
         transforms.Resize((img_size, img_size)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=norm_mean, std=norm_std)
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
     ])
     return train_ops, val_ops
 
-def transfer_weights(custom_model, pretrained_model):
-    pretrained_dict = pretrained_model.state_dict()
-    custom_dict = custom_model.state_dict()
-    transfer_layers = []
-    
-    for name, param in pretrained_dict.items():
-        if name in custom_dict:
-            if param.shape == custom_dict[name].shape:
-                custom_dict[name].copy_(param)
-                transfer_layers.append(name)
-    
-    custom_model.load_state_dict(custom_dict)
-    print(f"[Info] Weights transferred successfully for {len(transfer_layers)} layers (Entry Flow).")
-    return custom_model
 
 class DeepfakeDataset(Dataset):
     def __init__(self, csv_file, root_dir, transform=None, max_videos=None, frames_per_video=None):
@@ -248,31 +233,30 @@ class DeepfakeDataset(Dataset):
 
         def get_video_name(path_str):
             clean_path = str(path_str).replace('\\', '/')
-            parts = clean_path.split('/')
-            return parts[-2] if len(parts) >= 2 else "unknown_video"
+            if ':' in clean_path:
+                clean_path = clean_path.split(':', 1)[1]
+            parts = clean_path.strip('/').split('/')
+            return parts[-2] if len(parts) >= 2 else "unknown"
 
         self.data['video_name'] = self.data['path'].apply(get_video_name)
 
-        # 1. L?c theo s? lu?ng Video (max_videos)
         if max_videos is not None:
             unique_video_df = self.data[['video_name', 'label']].drop_duplicates(subset='video_name')
             real_videos = unique_video_df[unique_video_df['label'] == 0]['video_name'].tolist()
             fake_videos = unique_video_df[unique_video_df['label'] == 1]['video_name'].tolist()
-            
+
             rng = np.random.RandomState(42)
             rng.shuffle(real_videos)
             rng.shuffle(fake_videos)
             
             half_quota = max_videos // 2
-            selected_real = real_videos[:half_quota]
-            quota_fake = max_videos - len(selected_real) 
-            selected_fake = fake_videos[:quota_fake]
-            
-            selected_videos = set(selected_real + selected_fake)
-            self.data = self.data[self.data['video_name'].isin(selected_videos)].reset_index(drop=True)
-            print(f"[Dataset] {os.path.basename(str(csv_file))}: Selected {len(selected_videos)} videos.")
+            quota_real = min(len(real_videos), half_quota)
+            quota_fake = min(len(fake_videos), max_videos - quota_real)
 
-        # 2. L?c theo s? lu?ng Frames m?i Video (frames_per_video)
+            selected_videos = set(real_videos[:quota_real] + fake_videos[:quota_fake])
+            self.data = self.data[self.data['video_name'].isin(selected_videos)].reset_index(drop=True)
+            print(f"[Dataset] Video Selection: {len(selected_videos)} videos selected.")
+
         if frames_per_video is not None:
             self.data = self.data.groupby('video_name').apply(
                 lambda x: x.sample(n=min(len(x), frames_per_video), random_state=42)
@@ -289,28 +273,29 @@ class DeepfakeDataset(Dataset):
 
     def __getitem__(self, idx):
         row = self.data.iloc[idx]
-        path_str = str(row['path']).replace('\\', '/')
-        parts = path_str.split('/')
-        
+        clean_path = str(row['path']).replace('\\', '/')
+        if ':' in clean_path:
+            clean_path = clean_path.split(':', 1)[1]
+
+        filename = os.path.basename(clean_path)
+        parts = clean_path.split('/')
+
+        image_path = None
         if len(parts) >= 2:
-            video_name = parts[-2]
-            filename = parts[-1]
-        else:
-            video_name = "unknown" 
-            filename = parts[-1]
-            
-        image_path = os.path.join(self.root_dir, 'data', 'ff_frame', video_name, filename)
-        
+            image_path = os.path.join(self.root_dir, 'data', 'ff_frame', parts[-2], filename)
+
         image = Image.new('RGB', (224, 224))
         try:
-            if os.path.exists(image_path):
+            if image_path and os.path.exists(image_path):
                 image = Image.open(image_path).convert('RGB')
         except Exception:
             pass
-            
+
         if self.transform:
             image = self.transform(image)
+
         return image, int(row['label'])
+
 
 class Trainer:
     def __init__(self, model, loaders, config, save_dir, utils):
@@ -318,7 +303,7 @@ class Trainer:
         self.loaders = loaders
         self.config = config
         self.save_dir = save_dir
-        self.utils = utils # Inject utils for logging
+        self.utils = utils 
         self.criterion = nn.CrossEntropyLoss()
         self.optimizer = optim.Adam(model.parameters(), lr=config['lr'])
         self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=config['lr_decay_step'], gamma=0.5)
@@ -334,14 +319,15 @@ class Trainer:
         recall = recall_score(labels, preds, average='macro', zero_division=0)
         try:
             auc = roc_auc_score(labels, probs)
-        except:
+        except ValueError:
             auc = 0.5
         return {'loss': loss, 'acc': acc, 'auc': auc, 'f1': f1, 'precision': precision, 'recall': recall}
 
     def train_epoch(self):
         self.model.train()
-        total_loss = 0; all_lbl = []; all_pred = []; all_prob = []
-        
+        total_loss = 0
+        all_lbl, all_pred, all_prob = [], [], []
+
         for imgs, lbls in tqdm(self.loaders['train'], desc="Train", leave=False):
             imgs, lbls = imgs.to(self.config['device']), lbls.to(self.config['device'])
             self.optimizer.zero_grad()
@@ -349,19 +335,21 @@ class Trainer:
             loss = self.criterion(out, lbls)
             loss.backward()
             self.optimizer.step()
-            
+
             total_loss += loss.item() * imgs.size(0)
             probs = torch.softmax(out, dim=1)[:, 1].detach().cpu().numpy()
             preds = torch.argmax(out, dim=1).detach().cpu().numpy()
             all_lbl.extend(lbls.cpu().numpy()); all_pred.extend(preds); all_prob.extend(probs)
-            
-        return self.compute_metrics(total_loss / len(self.loaders['train'].dataset), all_lbl, all_pred, all_prob)
+
+        mean_loss = total_loss / len(self.loaders['train'].dataset)
+        return self.compute_metrics(mean_loss, all_lbl, all_pred, all_prob)
 
     @torch.no_grad()
     def evaluate(self, phase='val'):
         self.model.eval()
-        total_loss = 0; all_lbl = []; all_pred = []; all_prob = []
-        
+        total_loss = 0
+        all_lbl, all_pred, all_prob = [], [], []
+
         for imgs, lbls in tqdm(self.loaders[phase], desc=phase, leave=False):
             imgs, lbls = imgs.to(self.config['device']), lbls.to(self.config['device'])
             out = self.model(imgs)
@@ -370,13 +358,14 @@ class Trainer:
             probs = torch.softmax(out, dim=1)[:, 1].cpu().numpy()
             preds = torch.argmax(out, dim=1).cpu().numpy()
             all_lbl.extend(lbls.cpu().numpy()); all_pred.extend(preds); all_prob.extend(probs)
-            
-        return self.compute_metrics(total_loss / len(self.loaders[phase].dataset), all_lbl, all_pred, all_prob)
+
+        mean_loss = total_loss / len(self.loaders[phase].dataset)
+        return self.compute_metrics(mean_loss, all_lbl, all_pred, all_prob)
 
     def run(self):
         self.utils.log(f"Device: {self.config['device']}")
         self.utils.log(f"Start training with Max Videos: {self.config['max_videos']}, Frames/Video: {self.config['frames_per_video']}")
-
+        
         for epoch in range(self.config['epochs']):
             print(f"Epoch {epoch + 1}/{self.config['epochs']}")
             train_res = self.train_epoch()
@@ -387,7 +376,6 @@ class Trainer:
                 self.history[f'train_{k}'].append(train_res[k])
                 self.history[f'val_{k}'].append(val_res[k])
 
-            # Format log message
             log_msg = (f"Epoch {epoch+1}:\n"
                        f"   Train | Loss: {train_res['loss']:.4f} | Acc: {train_res['acc']:.4f} | AUC: {train_res['auc']:.4f} | F1: {train_res['f1']:.4f} | Pre: {train_res['precision']:.4f} | Rec: {train_res['recall']:.4f}\n"
                        f"   Val   | Loss: {val_res['loss']:.4f} | Acc: {val_res['acc']:.4f} | AUC: {val_res['auc']:.4f} | F1: {val_res['f1']:.4f} | Pre: {val_res['precision']:.4f} | Rec: {val_res['recall']:.4f}")
@@ -404,59 +392,89 @@ class Trainer:
         torch.save(self.model.state_dict(), self.save_dir / 'final_model.pth')
         self.utils.log("Final Model Saved.")
 
+
 def main():
     run_dir = Path(f"runs/{get_current_time_str()}_{BASE_CONFIG['project_name']}")
     utils = ResearchUtils(run_dir)
     utils.save_config(BASE_CONFIG)
-    
+
     train_ops, val_ops = get_transforms(BASE_CONFIG['img_size'])
     csv_dir = Path(BASE_CONFIG['data_path'])
-    
-    # L?y tham s? config m?i
+
+    if not (csv_dir / 'train.csv').exists():
+        print(f"not found train.csv in {csv_dir}")
+        return
+
     limit_videos = BASE_CONFIG.get('max_videos', None)
     limit_frames = BASE_CONFIG.get('frames_per_video', None)
 
-    # Truy?n limit_frames vào Dataset
-    train_set = DeepfakeDataset(csv_dir / 'train.csv', BASE_CONFIG['root_data_dir'], train_ops, 
-                                max_videos=limit_videos, frames_per_video=limit_frames)
-    val_set = DeepfakeDataset(csv_dir / 'val.csv', BASE_CONFIG['root_data_dir'], val_ops, 
-                              max_videos=limit_videos, frames_per_video=limit_frames)
-    test_set = DeepfakeDataset(csv_dir / 'test.csv', BASE_CONFIG['root_data_dir'], val_ops, 
-                               max_videos=limit_videos, frames_per_video=limit_frames)
+    train = DeepfakeDataset(csv_dir / 'train.csv', BASE_CONFIG['root_data_dir'], train_ops, 
+                            max_videos=limit_videos, frames_per_video=limit_frames)
+    val = DeepfakeDataset(csv_dir / 'val.csv', BASE_CONFIG['root_data_dir'], val_ops, 
+                          max_videos=limit_videos, frames_per_video=limit_frames)
+    test = DeepfakeDataset(csv_dir / 'test.csv', BASE_CONFIG['root_data_dir'], val_ops, 
+                           max_videos=limit_videos, frames_per_video=limit_frames)
+
+    use_pin_memory = (BASE_CONFIG['device'] == 'cuda')
 
     loaders = {
-        'train': DataLoader(train_set, batch_size=BASE_CONFIG['batch_size'], shuffle=True, num_workers=4, pin_memory=True),
-        'val': DataLoader(val_set, batch_size=BASE_CONFIG['batch_size'], shuffle=False, num_workers=4, pin_memory=True),
-        'test': DataLoader(test_set, batch_size=BASE_CONFIG['batch_size'], shuffle=False, num_workers=4, pin_memory=True)
+        'train': DataLoader(train, batch_size=BASE_CONFIG['batch_size'], shuffle=True, num_workers=BASE_CONFIG['num_workers'], pin_memory=use_pin_memory),
+        'val': DataLoader(val, batch_size=BASE_CONFIG['batch_size'], shuffle=False, num_workers=BASE_CONFIG['num_workers'], pin_memory=use_pin_memory),
+        'test': DataLoader(test, batch_size=BASE_CONFIG['batch_size'], shuffle=False, num_workers=BASE_CONFIG['num_workers'], pin_memory=use_pin_memory)
     }
 
-    print("Initializing XcepSimAM...")
-    model = XceptionSimAM(num_classes=BASE_CONFIG['model_params']['num_classes'])
+    print("Initializing Standard Xception Model...")
     
-    try:
-        print("Transferring ImageNet Weights...")
-        std_model = xception(pretrained='imagenet')
-        model = transfer_weights(model, std_model)
-        del std_model
-    except Exception as e:
-        print(f"Weight transfer failed ({e}). Training from scratch.")
+    model = xception(pretrained=None) 
 
-    # Truy?n utils vào Trainer
+    possible_paths = [
+        'pretrained/xception-43020ad28.pth', 
+        os.path.expanduser('~/.cache/torch/hub/checkpoints/xception-43020ad28.pth'), 
+        'xception-43020ad28.pth' 
+    ]
+    
+    weights_loaded = False
+    for path in possible_paths:
+        if os.path.exists(path):
+            print(f"Found local weights at: {path}")
+            try:
+                state_dict = torch.load(path)
+                model.load_state_dict(state_dict)
+                weights_loaded = True
+                print("Weights loaded successfully!")
+                break
+            except Exception as e:
+                print(f"Error loading {path}: {e}")
+
+    if not weights_loaded:
+        print("\n[WARNING] Could not find local weights!")
+        print("Server seems offline, so we CANNOT download from internet.")
+        print("Model will initialize with RANDOM weights (Performance will be poor initially).")
+        print(f"Please upload 'xception-43020ad28.pth' to: {os.getcwd()}/pretrained/\n")
+    
+    num_ftrs = model.last_linear.in_features
+    model.last_linear = nn.Sequential(
+        nn.Dropout(p=BASE_CONFIG['model_params']['dropout']),
+        nn.Linear(num_ftrs, BASE_CONFIG['model_params']['num_classes'])
+    )
+
     trainer = Trainer(model, loaders, BASE_CONFIG, run_dir, utils)
     trainer.run()
-    
+
     utils.plot_history(trainer.history)
-    
+
     print("\n" + "=" * 30)
     utils.log("Evaluating on TEST Set (Best Model)...")
     print("=" * 30)
 
-    if (run_dir / 'best_model.pth').exists():
-        model.load_state_dict(torch.load(run_dir / 'best_model.pth'))
-        
+    best_model_path = run_dir / 'best_model.pth'
+
+    if best_model_path.exists():
+        model.load_state_dict(torch.load(best_model_path))
+        model.to(BASE_CONFIG['device'])
+
         test_res = trainer.evaluate('test')
-        
-        # Ghi log k?t qu? Test
+
         final_msg = (f"FINAL TEST RESULTS (Best Epoch {trainer.best_epoch}):\n"
                      f"Accuracy : {test_res['acc']:.4f}\n"
                      f"AUC      : {test_res['auc']:.4f}\n"
@@ -466,11 +484,13 @@ def main():
                      f"Loss     : {test_res['loss']:.4f}")
         utils.log(final_msg)
         
-        # Generate Visualization
         try:
             generate_visualizations(model, loaders['test'], BASE_CONFIG['device'], run_dir)
         except Exception as e:
             utils.log(f"Error generating visualization: {e}")
+            
+    else:
+        utils.log("Not found best_model.pth. Skipping Test evaluation.")
 
 if __name__ == "__main__":
     main()

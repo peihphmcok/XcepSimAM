@@ -217,7 +217,21 @@ def xception(num_classes=1000, pretrained='imagenet'):
             "num_classes should be {}, but is {}".format(settings['num_classes'], num_classes)
 
         model = Xception(num_classes=num_classes)
-        model.load_state_dict(model_zoo.load_url(settings['url']))
+        
+        # --- ÐO?N CODE S?A L?I (FIX) ---
+        # 1. Load weights t? URL ho?c file
+        state_dict = model_zoo.load_url(settings['url'])
+        
+        # 2. Duy?t qua t?ng weight d? s?a l?i shape (2D -> 4D)
+        for name, weights in state_dict.items():
+            if 'pointwise' in name:
+                # N?u weight là 2 chi?u [Out, In], ta thêm 2 chi?u [1, 1] vào cu?i
+                if weights.dim() == 2:
+                    state_dict[name] = weights.unsqueeze(-1).unsqueeze(-1)
+        
+        # 3. Load state_dict dã s?a vào model
+        model.load_state_dict(state_dict)
+        # -------------------------------
 
         model.input_space = settings['input_space']
         model.input_size = settings['input_size']
